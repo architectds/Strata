@@ -2,14 +2,79 @@
 #include "strata/core/expert_cache.hpp"
 
 #include <cuda_runtime.h>
+#if !defined(STRATA_USE_HIP)
+#include <cuda.h>   // the virtual memory types only: the functions come from the driver at run time (vmm_api)
+#endif
 
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <type_traits>
 #include <utility>
 #include <cstring>
 
 namespace strata::core {
+
+#if !defined(STRATA_USE_HIP)
+namespace {
+
+// The driver's virtual memory calls, looked up through the runtime rather than linked: the engine links cudart only,
+// and a lendable cache is an option, so a driver without them refuses the option instead of the program not loading.
+struct VmmApi {
+    CUresult (CUDAAPI* reserve)(CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long) = nullptr;
+    CUresult (CUDAAPI* free_va)(CUdeviceptr, size_t) = nullptr;
+    CUresult (CUDAAPI* create)(CUmemGenericAllocationHandle*, size_t, const CUmemAllocationProp*,
+                               unsigned long long) = nullptr;
+    CUresult (CUDAAPI* release)(CUmemGenericAllocationHandle) = nullptr;
+    CUresult (CUDAAPI* map)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long) = nullptr;
+    CUresult (CUDAAPI* unmap)(CUdeviceptr, size_t) = nullptr;
+    CUresult (CUDAAPI* set_access)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t) = nullptr;
+    CUresult (CUDAAPI* granularity)(size_t*, const CUmemAllocationProp*, CUmemAllocationGranularity_flags) = nullptr;
+    CUresult (CUDAAPI* attribute)(int*, CUdevice_attribute, CUdevice) = nullptr;
+    CUresult (CUDAAPI* error_string)(CUresult, const char**) = nullptr;
+    bool ok = false;
+};
+
+const VmmApi& vmm_api() {
+    static const VmmApi api = [] {
+        VmmApi a;
+        auto get = [](const char* name, auto& fn) -> bool {
+            void* p = nullptr;
+            cudaDriverEntryPointQueryResult q{};
+#if CUDART_VERSION >= 12050
+            const cudaError_t e = cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q);
+#else
+            const cudaError_t e = cudaGetDriverEntryPoint(name, &p, cudaEnableDefault, &q);
+#endif
+            fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(p);
+            return e == cudaSuccess && q == cudaDriverEntryPointSuccess && p != nullptr;
+        };
+        a.ok = get("cuMemAddressReserve", a.reserve) && get("cuMemAddressFree", a.free_va) &&
+               get("cuMemCreate", a.create) && get("cuMemRelease", a.release) && get("cuMemMap", a.map) &&
+               get("cuMemUnmap", a.unmap) && get("cuMemSetAccess", a.set_access) &&
+               get("cuMemGetAllocationGranularity", a.granularity) && get("cuDeviceGetAttribute", a.attribute) &&
+               get("cuGetErrorString", a.error_string);
+        return a;
+    }();
+    return api;
+}
+
+std::string vmm_error(const char* what, CUresult r) {
+    const char* s = nullptr;
+    if (vmm_api().error_string == nullptr || vmm_api().error_string(r, &s) != CUDA_SUCCESS || s == nullptr) s = "?";
+    return std::string("ExpertCache: ") + what + " failed: " + s;
+}
+
+CUmemAllocationProp vmm_prop(int device) {
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device;
+    return prop;
+}
+
+}  // namespace
+#endif
 
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err) {
@@ -193,7 +258,9 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-    if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
+    if (lend_chunk_ > 0) {
+        if (!open_vmm(want, err)) return false;   // a lendable cache: chunks of one address range (see the header)
+    } else if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
         base_ = nullptr;
         char buf[256];
         std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
@@ -274,7 +341,8 @@ void ExpertCache::close() {
 #endif
     off_.clear();
     if (base_ != nullptr) {
-        cudaFree(base_);
+        if (vmm_reserved_ > 0) close_vmm();
+        else cudaFree(base_);
         base_ = nullptr;
     }
     residency_.clear();
@@ -442,6 +510,185 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
         return false;
     }
     return true;
+}
+
+
+// ---- the lendable cache (the image encoder on demand).  One address range, reserved once; `lend_chunk_` pieces of
+// physical memory mapped into it back to back.  Lending unmaps and frees the last pieces, so another process can have
+// that VRAM; reclaiming maps new pieces at the same addresses, so no pointer anything captured has to change.
+bool ExpertCache::open_vmm(uint64_t want, std::string& err) {
+#if defined(STRATA_USE_HIP)
+    (void) want;
+    err = "ExpertCache: a lendable cache (CUDA virtual memory management) is not available in a HIP build";
+    return false;
+#else
+    const VmmApi& v = vmm_api();
+    if (!v.ok) {
+        err = "ExpertCache: this driver does not expose CUDA virtual memory management (a lendable cache needs it)";
+        return false;
+    }
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int supported = 0;
+    if (v.attribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) dev) !=
+            CUDA_SUCCESS || supported == 0) {
+        err = "ExpertCache: this GPU does not support CUDA virtual memory management (a lendable cache needs it)";
+        return false;
+    }
+    const CUmemAllocationProp prop = vmm_prop(dev);
+    size_t gran = 0;
+    CUresult r = v.granularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+    if (r != CUDA_SUCCESS || gran == 0) {
+        err = vmm_error("cuMemGetAllocationGranularity", r);
+        return false;
+    }
+    const uint64_t chunk = (lend_chunk_ + gran - 1) / gran * gran;
+    const uint64_t total = (want + gran - 1) / gran * gran;
+    CUdeviceptr va = 0;
+    r = v.reserve(&va, (size_t) total, 0, 0, 0);
+    if (r != CUDA_SUCCESS) {
+        err = vmm_error("cuMemAddressReserve", r);
+        return false;
+    }
+    base_ = (uint8_t*) va;
+    vmm_reserved_ = total;
+    vmm_device_ = dev;
+    for (uint64_t off = 0; off < total; off += chunk) {
+        VmmChunk c;
+        c.off = off;
+        c.bytes = std::min<uint64_t>(chunk, total - off);
+        CUmemGenericAllocationHandle h = 0;
+        r = v.create(&h, (size_t) c.bytes, &prop, 0);
+        if (r == CUDA_SUCCESS) {
+            r = v.map(va + off, (size_t) c.bytes, 0, h, 0);
+            if (r != CUDA_SUCCESS) v.release(h);
+        }
+        if (r != CUDA_SUCCESS) {   // out of memory here is what a failed cudaMalloc is: the caller may retry smaller
+            err = vmm_error("cuMemCreate/cuMemMap", r) + " (the expert cache, " +
+                  std::to_string((unsigned long long) (total >> 20)) + " MiB)";
+            close_vmm();
+            return false;
+        }
+        c.handle = (unsigned long long) h;
+        vmm_.push_back(c);
+    }
+    CUmemAccessDesc acc = {};
+    acc.location = prop.location;
+    acc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    r = v.set_access(va, (size_t) total, &acc, 1);
+    if (r != CUDA_SUCCESS) {
+        err = vmm_error("cuMemSetAccess", r);
+        close_vmm();
+        return false;
+    }
+    return true;
+#endif
+}
+
+void ExpertCache::close_vmm() {
+#if !defined(STRATA_USE_HIP)
+    const VmmApi& v = vmm_api();
+    if (base_ != nullptr && v.ok) {
+        cudaDeviceSynchronize();   // nothing may still read a piece that is about to be unmapped
+        for (VmmChunk& c : vmm_)
+            if (c.handle != 0) {
+                v.unmap((CUdeviceptr) base_ + c.off, (size_t) c.bytes);
+                v.release((CUmemGenericAllocationHandle) c.handle);
+                c.handle = 0;
+            }
+        v.free_va((CUdeviceptr) base_, (size_t) vmm_reserved_);
+    }
+#endif
+    vmm_.clear();
+    vmm_reserved_ = 0;
+    base_ = nullptr;
+}
+
+size_t ExpertCache::tail_chunks(uint64_t bytes) const {
+    if (vmm_.size() < 2 || bytes == 0) return 0;
+    size_t k = 0;
+    uint64_t got = 0;
+    while (k + 1 < vmm_.size() && got < bytes) got += vmm_[vmm_.size() - 1 - k++].bytes;
+    return k;
+}
+
+int32_t ExpertCache::tail_first_slot(uint64_t bytes) const {
+    const size_t k = tail_chunks(bytes);
+    if (k == 0) return -1;
+    const uint64_t start = vmm_[vmm_.size() - k].off;
+    // the first slot whose bytes run past `start` (a slot cut in two by the boundary is lent whole)
+    if (off_.empty()) return (int32_t) std::min<int64_t>(slots_, (int64_t) (start / (uint64_t) blob_));
+    return (int32_t) (std::upper_bound(off_.begin() + 1, off_.end(), start) - (off_.begin() + 1));
+}
+
+uint64_t ExpertCache::release_tail(uint64_t bytes, std::string& err) {
+#if defined(STRATA_USE_HIP)
+    (void) bytes;
+    err = "ExpertCache: not lendable in a HIP build";
+    return 0;
+#else
+    const size_t k = tail_chunks(bytes);
+    if (k == 0) {
+        err = "ExpertCache: nothing to lend (the cache is not lendable, or it is a single piece)";
+        return 0;
+    }
+    const VmmApi& v = vmm_api();
+    for (size_t i = vmm_.size() - k; i < vmm_.size(); ++i) {
+        VmmChunk& c = vmm_[i];
+        if (c.handle == 0) continue;
+        CUresult r = v.unmap((CUdeviceptr) base_ + c.off, (size_t) c.bytes);
+        if (r == CUDA_SUCCESS) r = v.release((CUmemGenericAllocationHandle) c.handle);
+        if (r != CUDA_SUCCESS) {   // the pieces before this one are released; remap_tail maps them all again
+            err = vmm_error("cuMemUnmap/cuMemRelease", r);
+            return 0;
+        }
+        c.handle = 0;
+    }
+    return released_bytes();
+#endif
+}
+
+bool ExpertCache::remap_tail(std::string& err) {
+#if defined(STRATA_USE_HIP)
+    err = "ExpertCache: not lendable in a HIP build";
+    return false;
+#else
+    const VmmApi& v = vmm_api();
+    const CUmemAllocationProp prop = vmm_prop(vmm_device_);
+    CUmemAccessDesc acc = {};
+    acc.location = prop.location;
+    acc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    for (VmmChunk& c : vmm_) {
+        if (c.handle != 0) continue;
+        CUmemGenericAllocationHandle h = 0;
+        const CUdeviceptr at = (CUdeviceptr) base_ + c.off;
+        CUresult r = v.create(&h, (size_t) c.bytes, &prop, 0);
+        if (r == CUDA_SUCCESS) {
+            r = v.map(at, (size_t) c.bytes, 0, h, 0);
+            if (r != CUDA_SUCCESS) v.release(h);
+        }
+        if (r == CUDA_SUCCESS) {
+            r = v.set_access(at, (size_t) c.bytes, &acc, 1);
+            if (r != CUDA_SUCCESS) {
+                v.unmap(at, (size_t) c.bytes);
+                v.release(h);
+            }
+        }
+        if (r != CUDA_SUCCESS) {   // the pieces mapped so far stay mapped; a later call maps the rest
+            err = vmm_error("cuMemCreate/cuMemMap (taking the lent VRAM back)", r);
+            return false;
+        }
+        c.handle = (unsigned long long) h;
+    }
+    return true;
+#endif
+}
+
+uint64_t ExpertCache::released_bytes() const {
+    uint64_t b = 0;
+    for (const VmmChunk& c : vmm_)
+        if (c.handle == 0) b += c.bytes;
+    return b;
 }
 
 }  // namespace strata::core

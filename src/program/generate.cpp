@@ -352,6 +352,9 @@ struct Options {
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
     bool no_prefill_borrow = false;
+    /// --lendable-cache: the expert cache is pieces of one address range (CUDA virtual memory), so --serve can lend its
+    /// last MiB to another process and take them back (LEND <MiB> / RECLAIM: the image encoder on demand).  0 = off.
+    int lendable_chunk_mib = 0;
     /// Plan v0.3 P5 validation: batch only positions [0, P) and run the rest of the prompt through the token path
     /// (teacher-forced), so the logits of positions >= P - which depend on the batched state - can be scored
     /// against the oracle at many positions.  0 = the whole prompt but the last position.
@@ -510,6 +513,8 @@ void usage() {
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
+                 "  --lendable-cache     --serve: the expert cache can lend its last MiB to another process and take\n"
+                 "                       them back (LEND <MiB> / RECLAIM lines: the image encoder on demand)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
@@ -1211,6 +1216,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--no-split-rows") o.no_split_rows = true;
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
+        else if (a == "--lendable-cache") o.lendable_chunk_mib = 64;
         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
@@ -2984,6 +2990,8 @@ int main(int argc, char** argv) {
         int fake_fails = std::getenv("STRATA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("STRATA_TEST_CACHE_FAIL")) : 0;
         int failed = 0;
         int zero_reads = 0;
+        // --lendable-cache: the same slots, in pieces the serve loop can lend (LEND / RECLAIM below)
+        xcache.set_lendable((uint64_t) o.lendable_chunk_mib << 20);
         for (int attempt = 0;; ++attempt) {
             bool ok = false;
             if (fake_fails > 0) {
@@ -3046,6 +3054,9 @@ int main(int argc, char** argv) {
     if (o.expert_cache > 0) {
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
                      (long long) xcache.slots(), xcache.gib());
+        if (xcache.lendable())
+            std::fprintf(stderr, "strata generate: the expert cache is lendable in %d MiB pieces (--serve: LEND / "
+                                 "RECLAIM)\n", o.lendable_chunk_mib);
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
@@ -4133,6 +4144,22 @@ int main(int argc, char** argv) {
                                      : (uint64_t) (xc.slots() - first) *
                                            (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
         };
+        // the same two for buffers that end at slot `end` rather than at the end of the cache (a loan is out: LEND)
+        auto bytes_between = [&](const PfPart& p, int32_t first, int32_t end) -> uint64_t {
+            strata::core::ExpertCache& xc = *p.cache;
+            return xc.slot_offsets() ? xc.slot_offsets()[end] - xc.slot_offsets()[first]
+                                     : (uint64_t) (end - first) * (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+        };
+        auto slots_below = [&](const PfPart& p, int32_t end, int64_t c) -> int64_t {
+            const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, c);
+            if (p.cache->slot_offsets() == nullptr) {
+                const uint64_t blob = strata::kernels::cpu::expert_layout().max_blob;
+                return (int64_t) ((need + blob - 1) / blob);
+            }
+            int64_t k = 0;
+            while (k < end && bytes_between(p, (int32_t) (end - k), end) < need) ++k;
+            return k;
+        };
         // #340: a layer split whose caches already hold most experts streams few of them through the prompt path, so
         // the 384-slot ring (sized for a card that streams nearly every expert of a chunk) only makes every stage's
         // loan bigger: 96 slots (0.1.30's ring here) when >= 75% of the (layer, expert) pairs are resident.  One GPU
@@ -4763,6 +4790,14 @@ int main(int argc, char** argv) {
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
+        // --lendable-cache: a loan of the cache's last MiB to another process (LEND <MiB>, the image encoder).  The rows
+        // it took, as (residency index, slot) to refill at RECLAIM; the same rows by index, which the adaptive tier
+        // leaves alone until then (a lent expert swapped back in elsewhere would be resident twice after RECLAIM); the
+        // first lent slot, below which the prompt path lays its buffers out meanwhile; and the largest chunk that fits.
+        std::vector<std::pair<int32_t, int32_t>> loan_rows;
+        std::vector<uint8_t> loan_mark;
+        int32_t loan_first = -1;
+        int64_t loan_chunk = 0;
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
@@ -4801,8 +4836,11 @@ int main(int argc, char** argv) {
                 vict.clear();
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
+                const uint8_t* lent = loan_mark.empty() ? nullptr : loan_mark.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e))) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) {
+                        if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(lent && lent[e])) cand.emplace_back(u[e], e);
+                    }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -4986,7 +5024,7 @@ int main(int argc, char** argv) {
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                        "conversation_cache_min_free_mib=%lld engine=" STRATA_VERSION "\n",
+                        "conversation_cache_min_free_mib=%lld lendable=%d engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -4997,7 +5035,7 @@ int main(int argc, char** argv) {
                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
-                        (long long) o.conversation_cache_min_free_mib);
+                        (long long) o.conversation_cache_min_free_mib, xcache.lendable() ? 1 : 0);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -5044,6 +5082,36 @@ int main(int argc, char** argv) {
         bool mrope_identity = true;
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
+        // --lendable-cache: the loan comes back - the pieces are mapped again at the same addresses, every lent slot is
+        // refilled from the arena (its first and last read back and compared, as the startup fill does; every one with
+        // STRATA_VERIFY_RECLAIM=1) and only then marked resident again.  false: the cache cannot be trusted any more.
+        auto take_back = [&](std::string& e) -> bool {
+            if (!xcache.remap_tail(e)) return false;
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            for (const auto& [i, slot] : loan_rows) {
+                const int64_t l = i / g.n_expert, ex = i % g.n_expert;
+                const uint8_t* b = srcp->blob(l, ex);
+                if (b == nullptr || !xcache.fill_slot_queued(slot, b, e, (int64_t) lay.blob_bytes(l))) {
+                    if (b == nullptr) e = "RECLAIM: an expert's bytes are not in RAM";
+                    return false;
+                }
+            }
+            if (!xcache.sync_queued(e)) return false;
+            const bool all = std::getenv("STRATA_VERIFY_RECLAIM") != nullptr;
+            for (size_t k = 0; k < loan_rows.size(); ++k) {
+                if (!all && k != 0 && k + 1 != loan_rows.size()) continue;
+                const auto [i, slot] = loan_rows[k];
+                const int64_t l = i / g.n_expert, ex = i % g.n_expert;
+                if (!xcache.verify_slot(slot, srcp->blob(l, ex), e, (int64_t) lay.blob_bytes(l))) return false;
+            }
+            for (const auto& [i, slot] : loan_rows) host_res[(size_t) i] = slot;
+            res_upload();
+            loan_rows.clear();
+            loan_mark.clear();
+            loan_first = -1;
+            loan_chunk = 0;
+            return true;
+        };
         while (next_line(line)) {
             // #477: every --expert-profile-save-every minutes, before the next request (at QUIT: after the loop)
             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
@@ -5057,6 +5125,139 @@ int main(int argc, char** argv) {
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
+            // ---- --lendable-cache: the image encoder on demand.  `LEND <MiB>` gives the expert cache's last MiB
+            // (whole 64 MiB pieces) back to the driver, so another process - the server starts strata-vision next - has
+            // that VRAM; `RECLAIM` takes it back once that process has exited.  Meanwhile the experts those slots held
+            // are CPU misses (what an expert the cache never held is), the adaptive tier leaves them alone, and the
+            // prompt path lays its buffers out below the loan.  Between requests only: the server's FIFO orders them.
+            //   LEND <MiB> -> LENT <MiB lent> <experts now misses> <prompt chunk meanwhile>   (again: the same loan)
+            //   RECLAIM    -> RECLAIMED <MiB back> <experts refilled> <ms>                    (none out: 0 0 0)
+            if (line.rfind("LEND ", 0) == 0 || line == "RECLAIM") {
+                const Clock::time_point t0 = Clock::now();
+                if (!xcache.lendable() || d_res == nullptr || srcp == nullptr || !stages.empty() ||
+                    o.expert_cache_remote[0] > 0) {
+                    std::printf("ERR LEND and RECLAIM need --lendable-cache, an --expert-profile cache and one GPU\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                apply_pending(true);   // adaptive swaps in flight land first: one may be writing a slot that is lent
+                std::string le;
+                if (line == "RECLAIM") {
+                    if (loan_first < 0) {
+                        std::printf("RECLAIMED 0 0 0\n");
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    // the borrower has to be gone: under WDDM an allocation past the card's memory does not fail, it
+                    // pages - and a page-in while a verify graph spins on a host flag stalls the request for good
+                    const uint64_t back = xcache.released_bytes();
+                    size_t free_b = 0, total_b = 0;
+                    cudaMemGetInfo(&free_b, &total_b);
+                    if ((uint64_t) free_b < back + (128ull << 20)) {
+                        std::printf("ERR RECLAIM: %llu MiB of VRAM free and the loan is %llu MiB: try again once the "
+                                    "process that borrowed it has exited\n", (unsigned long long) (free_b >> 20),
+                                    (unsigned long long) (back >> 20));
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    const size_t n_rows = loan_rows.size();
+                    // mapping the memory again can fail like any allocation (Windows also charges it to the page
+                    // file, issue #60): nothing is marked resident yet, so the loan simply stays out until a later try
+                    if (!xcache.remap_tail(le)) {
+                        std::fprintf(stderr, "strata serve: RECLAIM: %s; the loan stays out\n", le.c_str());
+                        std::printf("ERR RECLAIM: %s - try again later\n", le.c_str());
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    if (!take_back(le)) {
+                        std::fprintf(stderr, "strata serve: RECLAIM failed: %s\n", le.c_str());
+                        std::printf("ERR RECLAIM: %s\n", le.c_str());
+                        std::fflush(stdout);
+                        return 1;   // the cache's bytes are unknown now: the server starts the engine again
+                    }
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                    std::fprintf(stderr, "strata serve: took back the %llu MiB lent from the expert cache: %zu experts "
+                                         "refilled in %.0f ms\n", (unsigned long long) (back >> 20), n_rows, ms);
+                    std::printf("RECLAIMED %llu %zu %.0f\n", (unsigned long long) (back >> 20), n_rows, ms);
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (loan_first >= 0) {   // already out: the same loan (the server may ask again after a restart)
+                    std::printf("LENT %llu %zu %lld\n", (unsigned long long) (xcache.released_bytes() >> 20),
+                                loan_rows.size(), (long long) loan_chunk);
+                    std::fflush(stdout);
+                    continue;
+                }
+                const long long mib = std::atoll(line.c_str() + 5);
+                const int32_t vf = mib > 0 ? xcache.tail_first_slot((uint64_t) mib << 20) : -1;
+                if (vf < 0) {
+                    std::printf("ERR LEND: give a size in MiB that is smaller than the expert cache\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                // the prompt path's chunk below the loan: the largest that leaves 128 slots (and with --prefill auto
+                // the lend cap), the rule the startup plan applied to the whole cache.  The startup chunk first, then
+                // the usual sizes below it (a 12288 chunk that no longer fits takes 8192, not half of itself)
+                int64_t chunk = 0;
+                if (!pf_parts.empty() && pf_parts[0].first >= 0) {
+                    std::vector<int64_t> cands{o.prefill_chunk};
+                    for (const int64_t c : {32768, 16384, 12288, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256})
+                        if (c < o.prefill_chunk) cands.push_back(c);
+                    for (const int64_t c : cands) {
+                        const int64_t k = slots_below(pf_parts[0], vf, c);
+                        if (k <= 0 || k + 128 > vf || (o.prefill_auto && k * 100 > kAutoLendPct * vf)) continue;
+                        chunk = c;
+                        break;
+                    }
+                    if (chunk == 0) {
+                        std::printf("ERR LEND: %lld MiB would leave the prompt path no room for its buffers\n", mib);
+                        std::fflush(stdout);
+                        continue;
+                    }
+                }
+                // every expert it takes has to stay computable by the CPU, and refillable at RECLAIM
+                bool in_ram = true;
+                for (size_t i = 0; i < host_res.size() && in_ram; ++i)
+                    if (host_res[i] >= vf) in_ram = srcp->blob((int64_t) i / g.n_expert, (int64_t) i % g.n_expert) != nullptr;
+                if (!in_ram) {
+                    std::printf("ERR LEND: the experts those slots hold are not all in RAM (the resident RAM mode)\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                loan_mark.assign(host_res.size(), 0);
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (host_res[i] >= vf) {
+                        loan_rows.emplace_back((int32_t) i, host_res[i]);
+                        loan_mark[i] = 1;
+                        host_res[i] = strata::core::kNotResident;
+                    }
+                res_upload();
+                cudaDeviceSynchronize();   // nothing may still read a slot that is about to be unmapped
+                const uint64_t lent = xcache.release_tail((uint64_t) mib << 20, le);
+                if (lent == 0) {
+                    std::string e2;
+                    if (!take_back(e2)) {   // a piece may have gone: map and refill everything it took, as RECLAIM does
+                        std::fprintf(stderr, "strata serve: LEND failed (%s) and undoing it failed: %s\n", le.c_str(),
+                                     e2.c_str());
+                        std::printf("ERR LEND: %s\n", le.c_str());
+                        std::fflush(stdout);
+                        return 1;
+                    }
+                    std::printf("ERR LEND: %s\n", le.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
+                loan_first = vf;
+                loan_chunk = chunk;
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                std::fprintf(stderr, "strata serve: lent %llu MiB of the expert cache (slots %d..%lld): %zu experts are "
+                                     "CPU misses and prompts read in chunks of up to %lld tokens until RECLAIM (%.0f ms)\n",
+                             (unsigned long long) (lent >> 20), (int) vf, (long long) (xcache.slots() - 1),
+                             loan_rows.size(), (long long) chunk, ms);
+                std::printf("LENT %llu %zu %lld\n", (unsigned long long) (lent >> 20), loan_rows.size(), (long long) chunk);
+                std::fflush(stdout);
+                continue;
+            }
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
@@ -5518,7 +5719,9 @@ int main(int argc, char** argv) {
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
-                const int64_t want_full = request_chunk(tokens, o.prefill_chunk);
+                // (with a loan out to another process, at most the chunk that fits below it)
+                const int64_t want_full =
+                    request_chunk(tokens, loan_first >= 0 && loan_chunk > 0 ? loan_chunk : o.prefill_chunk);
                 // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
                 const int64_t want = split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
                                                                                  : want_full;
@@ -5537,9 +5740,15 @@ int main(int argc, char** argv) {
                         if (!refill_one(p, e)) return false;
                     }
                     const strata::core::OnDevice on(p.dev);
-                    const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
+                    // LEND: the cache's last slots are unmapped, so CUDA0's buffers end where that loan begins (the
+                    // slots from `loan_first` on are already non-resident, so the marking below cannot reach them)
+                    const bool below = loan_first >= 0 && p.cache == &xcache;
+                    const int32_t first = below ? (int32_t) (loan_first - slots_below(p, loan_first, want))
+                                                : std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
                     if (want != p.sp->chunk() || first != p.first_now) {
-                        if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                        if (!p.sp->relayout(want, p.cache->device_slot(first),
+                                            below ? bytes_between(p, first, loan_first) : part_bytes(p, first), e))
+                            return false;
                         p.first_now = first;
                     }
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only

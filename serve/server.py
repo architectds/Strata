@@ -431,6 +431,25 @@ class StrataEngine:
         self.__init__(*self.spawn)
         self.info = {**info, **self.info}
 
+    def command(self, line: str, timeout: float = 120.0) -> str:
+        """A control line between requests (LEND <MiB> / RECLAIM, engine --lendable-cache): its one-line reply.  The
+        caller holds the service's fifo, so no request's output is in the queue."""
+        try:
+            self.proc.stdin.write(line + "\n")
+            self.proc.stdin.flush()
+        except OSError:
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        deadline = time.time() + timeout
+        while True:
+            try:
+                reply = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise RuntimeError(f"the engine did not answer {line.split()[0]} in {timeout:.0f} s") from None
+            if reply is None:
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+            if reply.startswith(("LENT", "RECLAIMED", "ERR")):
+                return reply.strip()
+
     def _parse_done(self, line):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
@@ -649,11 +668,19 @@ class StrataEngine:
 
 
 class Vision:
-    """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
-    lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
-    sends the same picture again (every turn, with most clients) encodes it once."""
+    """The image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>` lines and
+    writes each image's embeddings; results are cached by the image's hash, so a conversation that sends the same
+    picture again (every turn, with most clients) encodes it once.
 
-    def __init__(self, cfg: dict, log=None, env: dict | None = None):
+    Resident by default (started with the server).  On demand (`--vision-on-demand`, "vision_on_demand": true in the
+    config; the engine gets --lendable-cache) it is not: the first picture the cache does not hold starts it, after the
+    engine has lent it VRAM from the end of its expert cache (`before_start`: the service's LEND).  It then stays
+    loaded while pictures keep coming - someone looking at pictures sends the next one soon - and once `idle_s` seconds
+    (default 600) have passed since the last one, the service stops it and the engine takes the VRAM back (RECLAIM).
+    Text requests run all along; while the encoder is loaded, the experts that VRAM held are computed by the CPU."""
+
+    def __init__(self, cfg: dict, log=None, env: dict | None = None, on_demand: bool = False, idle_s: float = 600,
+                 lend_mib: int = 1400):
         args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
         if cfg.get("gpu"):
             args.append("--gpu")
@@ -663,10 +690,17 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
         self.spawn = (args, log, env)                   # to start it again after an unload
-        self.stopped = False
-        self._start()
+        self.on_demand = bool(on_demand)
+        self.idle_s = float(idle_s)                     # on demand: unloaded this long after the last picture
+        self.lend_mib = int(lend_mib)                   # on demand: the VRAM the engine lends it (it uses ~1.3 GB)
+        self.before_start = None                        # on demand: the service's LEND, before the process starts
+        self.last_used = 0.0                            # when the last picture was asked for (time.time())
+        self.proc = None
+        self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
+        if not self.on_demand:
+            self._start()
 
     def _start(self):
         args, log, env = self.spawn
@@ -679,17 +713,19 @@ class Vision:
         self.stopped = False
 
     def alive(self) -> bool:
-        return not self.stopped and self.proc.poll() is None
+        return not self.stopped and self.proc is not None and self.proc.poll() is None
 
     def unload(self):
         """Stop the encoder process (its VRAM or RAM goes back); the encoded images stay cached on disk."""
-        self.close()
+        if self.proc is not None:
+            self.close()
         self.stopped = True
 
     def restart(self):
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
         try:
-            self.proc.kill()
+            if self.proc is not None:
+                self.proc.kill()
         except OSError:
             pass
         self._start()
@@ -740,8 +776,15 @@ class Vision:
         data = self.normalize(self.load(source))
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
+            self.last_used = time.time()                # a picture asked about again counts as looking at pictures
             if key in self.cache:
                 return self.cache[key]
+            # on demand: the first new picture in a while starts it (a failed start leaves the loan out: the service's
+            # idle check takes it back).  A resident encoder that stopped is started again with the engine, as before.
+            if getattr(self, "on_demand", False) and not self.alive():
+                if self.before_start is not None:
+                    self.before_start()
+                self._start()
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
@@ -750,6 +793,7 @@ class Vision:
                 line = self.proc.stdout.readline().strip()
             finally:                                                   # #352: also when the encoder's pipe is gone
                 img.unlink(missing_ok=True)
+            self.last_used = time.time()                # the idle time counts from the end of the last encode
             if not line.startswith("OK"):
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
@@ -760,12 +804,23 @@ class Vision:
             return self.cache[key]
 
     def close(self):
+        if self.proc is None:
+            return
         try:
             self.proc.stdin.write("QUIT\n")
             self.proc.stdin.flush()
             self.proc.wait(timeout=10)
         except Exception:
             self.proc.kill()
+            try:
+                self.proc.wait(timeout=10)              # on demand its VRAM is taken back next: it must be gone
+            except subprocess.TimeoutExpired:
+                pass
+        for pipe in (self.proc.stdin, self.proc.stdout):   # an encoder on demand starts and stops many times
+            try:
+                pipe.close()
+            except OSError:
+                pass
 
 
 def gpu_list(cfg: dict) -> list[int]:
@@ -798,6 +853,9 @@ def engine_args(cfg: dict) -> list[str]:
     # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
     if len(gpu_list(cfg)) > 1 and cfg.get("split_skip_if_fits") and "--split-skip-if-fits" not in args:
         args.append("--split-skip-if-fits")
+    # images on demand: the engine lends the image encoder part of its expert cache while it is loaded
+    if cfg.get("vision") and cfg.get("vision_on_demand") is True and "--lendable-cache" not in args:
+        args.append("--lendable-cache")
     return learned_profile_args(cfg, args)
 
 
@@ -992,6 +1050,16 @@ class Service:
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # images on demand (Vision.on_demand): the engine has lent the image encoder VRAM (LEND) and not taken it back
+        self.vision_lent = False
+        if vision is not None and getattr(vision, "on_demand", False):
+            if (getattr(engine, "info", {}) or {}).get("lendable") == 1 and hasattr(engine, "command"):
+                vision.before_start = self._vision_lend
+            else:
+                print("[strata] images: this engine cannot lend VRAM from its expert cache (that needs a 0.1.31+ engine "
+                      "started with --lendable-cache), so the image encoder starts now and stays loaded", flush=True)
+                vision.on_demand = False
+                vision.restart()
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -1034,7 +1102,91 @@ class Service:
         return value if value > 0 else None
 
     def _vision_down(self) -> bool:
-        return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
+        """A resident image encoder that stopped (it is started again with the engine); one on demand starts with the
+        next picture instead."""
+        return self.vision is not None and hasattr(self.vision, "alive") and not getattr(self.vision, "on_demand", False) \
+            and not self.vision.alive()
+
+    def _vision_lend(self):
+        """The image encoder is about to start: the engine lends it VRAM from the end of its expert cache.  Called from
+        Vision.encode, under the fifo (the engine is between requests)."""
+        reply = self.engine.command(f"LEND {self.vision.lend_mib}")
+        if not reply.startswith("LENT"):
+            raise ValueError("the model could not make room on the GPU for the image encoder: " +
+                             (reply[4:] if reply.startswith("ERR ") else reply))
+        f = reply.split()
+        if not self.vision_lent:
+            print(f"[strata] images: the model lends the image encoder {f[1]} MiB of its expert cache ({f[2]} experts "
+                  f"are computed by the CPU meanwhile); starting it - it unloads {self.vision.idle_s / 60:.0f} min after "
+                  "the last picture", flush=True)
+        self.vision_lent = True
+
+    def _vision_reclaim(self) -> bool:
+        """The image encoder has exited: the engine takes its VRAM back and refills those experts.  The caller holds
+        the fifo.  False: not yet (its memory is still being freed) - the next idle check tries again."""
+        if not self.vision_lent:
+            return True
+        if not self.loaded():                           # a new engine starts with its whole cache
+            self.vision_lent = False
+            return True
+        reply = ""
+        for _ in range(10):
+            try:
+                reply = self.engine.command("RECLAIM", timeout=300)
+            except EngineDied:
+                self.vision_lent = False                # the next request starts the engine again, with all of it
+                return False
+            if reply.startswith("RECLAIMED"):
+                f = reply.split()
+                print(f"[strata] images: the expert cache has its {f[1]} MiB back ({f[2]} experts refilled in "
+                      f"{float(f[3]) / 1000:.1f} s)", flush=True)
+                self.vision_lent = False
+                return True
+            time.sleep(0.5)                             # the encoder's VRAM can take a moment to be freed
+        print(f"[strata] images: the expert cache cannot take its VRAM back yet ({reply}); trying again later", flush=True)
+        return False
+
+    def vision_idle_check(self):
+        """Images on demand: unload the image encoder once it has been idle for `idle_s`, and take the VRAM back -
+        only between requests, and never while one is waiting."""
+        v = self.vision
+        if v is None or not getattr(v, "on_demand", False):
+            return
+        due = v.alive() and time.time() - v.last_used >= v.idle_s
+        if not due and not (self.vision_lent and not v.alive()):   # nothing to do, or an earlier RECLAIM to retry
+            return
+        if not self.fifo.acquire(blocking=False):
+            return
+        try:
+            with self.status_lock:
+                if self.status.get("busy") or self.status.get("queued"):
+                    return
+            if v.alive():
+                if time.time() - v.last_used < v.idle_s:   # a picture came in meanwhile
+                    return
+                with v.lock:                            # not while a picture is being encoded
+                    v.unload()
+                print(f"[strata] images: no new picture for {v.idle_s / 60:.0f} min: the image encoder is unloaded",
+                      flush=True)
+            self._vision_reclaim()
+        finally:
+            self.fifo.release()
+
+    def start_vision_idle(self):
+        v = self.vision
+        if v is None or not getattr(v, "on_demand", False):
+            return
+        print(f"[strata] images: the image encoder starts with the first picture and unloads {v.idle_s / 60:.0f} min "
+              "after the last one", flush=True)
+
+        def loop():
+            while True:
+                time.sleep(max(1.0, min(15.0, v.idle_s / 8)))
+                try:
+                    self.vision_idle_check()
+                except Exception as e:                  # never let the checker die: the next tick tries again
+                    print(f"[strata] images: the idle check failed: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
@@ -1086,6 +1238,11 @@ class Service:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
             print(f"[strata] the engine had stopped (exit code {code}); starting it again "
                   "(a minute or two) ...", flush=True)
+        if getattr(self.vision, "on_demand", False):   # its loan ended with that engine: the new one sizes its cache
+            if self.vision.alive():                     # for the whole card, so the encoder stops first (the next
+                with self.vision.lock:                  # picture starts it again, with a new loan)
+                    self.vision.unload()
+            self.vision_lent = False
         self.engine.restart()
         print("[strata] the engine is running again", flush=True)
 
@@ -1136,6 +1293,7 @@ class Service:
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
+            self.vision_lent = False                    # the loan ended with the engine
             print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
                   "the next request loads it again", flush=True)
             return "unloaded"
@@ -2179,6 +2337,11 @@ def make_handler(svc: Service):
                 with svc.status_lock:
                     s = dict(svc.status)
                 now = time.time()
+                v = svc.vision
+                if v is not None and getattr(v, "on_demand", False):   # images on demand: loaded, and for how long
+                    s["image_encoder"] = {"loaded": v.alive(), "vram_lent": svc.vision_lent,
+                                          "unloads_in_s": max(0, round(v.idle_s - (now - v.last_used)))
+                                          if v.alive() else None}
                 if s.get("busy"):
                     s["elapsed_s"] = round(now - s["started"], 1)
                     if s.get("first_token"):
@@ -2865,10 +3028,27 @@ def main() -> int:
                          "\"min_free_vram_mib\" in the config; default: always load)")
     ap.add_argument("--before-load", help="a command run before the model is loaded again (e.g. to unload another "
                                           "server's model; also \"before_load\" in the config, a string or a list)")
+    ap.add_argument("--vision-on-demand", action="store_true",
+                    help="images on demand: the image encoder starts with the first picture instead of with the server, "
+                         "in VRAM the engine lends it from the end of its expert cache (--lendable-cache), and unloads "
+                         "--vision-idle seconds after the last picture, when the engine takes the VRAM back (also "
+                         "\"vision_on_demand\": true in the config; default: the encoder stays loaded)")
+    ap.add_argument("--vision-idle", type=float, default=None, metavar="SECONDS",
+                    help="images on demand: unload the image encoder this long after the last picture (also "
+                         "\"vision_idle_s\" in the config; default 600)")
+    ap.add_argument("--vision-lend-mib", type=int, default=None,
+                    help="images on demand: the VRAM the engine lends the image encoder (also \"vision_lend_mib\" in the "
+                         "config; default 1400: the GPU encoder uses ~1.3 GB at 1024 image tokens)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+    if a.vision_on_demand:                              # into the config's keys, which engine_args reads
+        cfg["vision_on_demand"] = True
+    if a.vision_idle is not None:
+        cfg["vision_idle_s"] = a.vision_idle
+    if a.vision_lend_mib is not None:
+        cfg["vision_lend_mib"] = a.vision_lend_mib
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
@@ -2904,13 +3084,17 @@ def main() -> int:
         if lazy and cfg.get("vision"):
             ap.error("lazy loading is text-only; disable vision in the config")
         if cfg.get("vision"):
-            print("loading the vision encoder ...", flush=True)
+            on_demand = cfg.get("vision_on_demand") is True
+            if not on_demand:                           # on demand: it starts with the first picture
+                print("loading the vision encoder ...", flush=True)
             # relative paths are the config's cwd's, as for the engine below
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env))
+                            env=vision_env(cfg, env), on_demand=on_demand,
+                            idle_s=float(cfg.get("vision_idle_s") or 600),
+                            lend_mib=int(cfg.get("vision_lend_mib") or 1400))
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
@@ -3007,6 +3191,7 @@ def main() -> int:
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
+    svc.start_vision_idle()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
