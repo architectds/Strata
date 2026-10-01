@@ -2329,5 +2329,178 @@ class LostStep(unittest.TestCase):
         self.run_mode("stop", stream=False)
 
 
+# a stand-in for strata-vision: READY, then one SVE1 record of two rows per ENC line, until QUIT
+FAKE_ENCODER = """
+import struct, sys
+print("READY 4", flush=True)
+for line in sys.stdin:
+    f = line.split()
+    if not f or f[0] == "QUIT":
+        break
+    with open(f[2], "wb") as o:
+        o.write(struct.pack("<5i", 0x31455653, 2, 1, 2, 4) + struct.pack("<8f", *range(8)))
+    print("OK 2 1 2 5.0", flush=True)
+"""
+
+
+class LendingEngine(UnloadableEngine):
+    """A mock engine started with --lendable-cache: LEND / RECLAIM lines, answered as the real one answers them."""
+
+    def __init__(self, *a, reclaim_refusals=0, **kw):
+        super().__init__(*a, **kw)
+        self.info = {"lendable": 1}
+        self.commands, self.lent, self.refusals = [], False, reclaim_refusals
+
+    def command(self, line, timeout=120.0):
+        self.commands.append(line)
+        if line.startswith("LEND "):
+            self.lent = True
+            return "LENT 1442 884 8192"
+        if self.lent and self.refusals > 0:          # the encoder's VRAM is not free yet
+            self.refusals -= 1
+            return "ERR RECLAIM: 900 MiB of VRAM free and the loan is 1442 MiB"
+        was, self.lent = self.lent, False
+        return "RECLAIMED 1442 884 120" if was else "RECLAIMED 0 0 0"
+
+    def restart(self):
+        super().restart()
+        self.lent = False                            # a new engine has its whole cache
+
+
+class ImagesOnDemand(unittest.TestCase):
+    """The image encoder on demand: started (after the engine lends it VRAM) by the first new picture, kept while
+    pictures keep coming, unloaded `idle_s` after the last one - and only then does the engine take the VRAM back."""
+
+    def setUp(self):
+        from serve.server import Vision
+        self.d = Path(tempfile.mkdtemp())
+        script = self.d / "fake_vision.py"
+        script.write_text(FAKE_ENCODER, encoding="utf-8")
+        self.pics = []
+        for i in range(2):
+            p = self.d / f"pic{i}.png"
+            p.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes([i]) * 16)   # PNG magic: passed to the encoder as it is
+            self.pics.append(str(p))
+        tok = ByteTokenizer()
+        self.engine = LendingEngine(tok, "</think>\n\nok", max_context=CTX)
+        self.vision = Vision({"exe": "unused", "mmproj": "m", "model": "x"}, on_demand=True, idle_s=600)
+        self.vision.spawn = ([sys.executable, str(script)], None, None)
+        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), vision=self.vision)
+
+    def tearDown(self):
+        self.vision.unload()
+
+    def ask(self, pic):
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "what is this?"}, {"type": "image", "source": pic}]}]
+        ids, _, _ = self.svc.prepare(msgs, None, {})   # it encodes under the fifo, as a request does
+        self.svc.embeddings.path.unlink(missing_ok=True)
+        return ids
+
+    def test_not_started_until_a_picture(self):
+        self.assertFalse(self.vision.alive())
+        self.assertEqual(self.engine.commands, [])
+
+    def test_a_picture_lends_then_starts_it(self):
+        self.ask(self.pics[0])
+        self.assertTrue(self.vision.alive())
+        self.assertEqual(self.engine.commands, ["LEND 1400"])
+        self.assertTrue(self.svc.vision_lent)
+
+    def test_kept_while_pictures_come(self):
+        self.ask(self.pics[0])
+        self.ask(self.pics[1])                       # a new picture: encoded by the running encoder, no new loan
+        self.ask(self.pics[0])                       # the same picture again: from the cache
+        self.assertEqual(self.engine.commands, ["LEND 1400"])
+        self.svc.vision_idle_check()                 # not idle yet: nothing happens
+        self.assertTrue(self.vision.alive())
+        self.assertEqual(self.engine.commands, ["LEND 1400"])
+
+    def test_idle_unloads_then_reclaims(self):
+        self.ask(self.pics[0])
+        self.vision.last_used -= 601
+        self.svc.vision_idle_check()
+        self.assertFalse(self.vision.alive())
+        self.assertEqual(self.engine.commands, ["LEND 1400", "RECLAIM"])
+        self.assertFalse(self.svc.vision_lent)
+        self.ask(self.pics[1])                       # the next picture: a new loan, the encoder again
+        self.assertTrue(self.vision.alive())
+        self.assertEqual(self.engine.commands, ["LEND 1400", "RECLAIM", "LEND 1400"])
+
+    def test_not_while_a_request_runs(self):
+        self.ask(self.pics[0])
+        self.vision.last_used -= 601
+        with self.svc.fifo:                          # a request holds the fifo: the check leaves it alone
+            self.svc.vision_idle_check()
+        self.assertTrue(self.vision.alive())
+        self.svc.vision_idle_check()
+        self.assertFalse(self.vision.alive())
+
+    def test_reclaim_waits_for_the_vram(self):
+        self.engine.refusals = 3                     # the encoder's memory is freed a moment after it exits
+        self.ask(self.pics[0])
+        self.vision.last_used -= 601
+        self.svc.vision_idle_check()
+        self.assertEqual(self.engine.commands, ["LEND 1400"] + ["RECLAIM"] * 4)
+        self.assertFalse(self.svc.vision_lent)
+
+    def test_reclaim_tried_again_later(self):
+        self.engine.refusals = 100
+        self.ask(self.pics[0])
+        self.vision.last_used -= 601
+        self.svc.vision_idle_check()
+        self.assertTrue(self.svc.vision_lent)        # still out: the next check tries again
+        self.engine.refusals = 0
+        self.svc.vision_idle_check()
+        self.assertFalse(self.svc.vision_lent)
+
+    def test_engine_unload_ends_the_loan(self):
+        self.ask(self.pics[0])
+        self.assertEqual(self.svc.unload(), "unloaded")
+        self.assertFalse(self.vision.alive())
+        self.assertFalse(self.svc.vision_lent)
+        self.svc.load()
+        self.assertFalse(self.vision.alive())       # not started with the engine: with the next picture
+        self.ask(self.pics[1])
+        self.assertEqual(self.engine.commands, ["LEND 1400", "LEND 1400"])
+
+    def test_status_shows_it(self):
+        httpd = serve(self.svc, port=0)
+        try:
+            url = f"http://127.0.0.1:{httpd.server_address[1]}/status"
+            with urllib.request.urlopen(url, timeout=10) as r:
+                self.assertEqual(json.loads(r.read())["image_encoder"]["loaded"], False)
+            self.ask(self.pics[0])
+            with urllib.request.urlopen(url, timeout=10) as r:
+                enc = json.loads(r.read())["image_encoder"]
+            self.assertEqual((enc["loaded"], enc["vram_lent"]), (True, True))
+            self.assertGreater(enc["unloads_in_s"], 590)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_an_engine_that_cannot_lend_keeps_it_resident(self):
+        from serve.server import Vision
+        tok = ByteTokenizer()
+        v = Vision({"exe": "unused", "mmproj": "m", "model": "x"}, on_demand=True)
+        v.spawn = self.vision.spawn
+        try:
+            Service(UnloadableEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                    vision=v)
+            self.assertTrue(v.alive())
+            self.assertFalse(v.on_demand)
+        finally:
+            v.unload()
+
+    def test_the_engine_gets_lendable_cache_only_on_demand(self):
+        from serve.server import engine_args
+        base = {"args": ["--serve"], "vision": {"exe": "v", "mmproj": "m", "model": "x"}}
+        self.assertNotIn("--lendable-cache", engine_args(base))                                 # resident: as before
+        self.assertIn("--lendable-cache", engine_args({**base, "vision_on_demand": True}))
+        self.assertNotIn("--lendable-cache", engine_args({**base, "vision_on_demand": "yes"}))  # true only
+        self.assertNotIn("--lendable-cache", engine_args({"args": ["--serve"], "vision_on_demand": True}))   # no images
+        self.assertEqual(engine_args({**base, "vision_on_demand": True, "args": ["--serve", "--lendable-cache"]})
+                         .count("--lendable-cache"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

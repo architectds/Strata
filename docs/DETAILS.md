@@ -425,6 +425,49 @@ before). A relative path is in the Strata folder; one file per model, and a prof
 (point the key at another file). The file is a fingerprint of what you used the model for: it stays on your PC.
 Without the key nothing is counted or written. Setup rewrites the config when run again: add the key again then.
 
+### Images on demand (fork: `carry/vision-on-demand`)
+
+With images on, the GPU image encoder (`strata-vision`) holds ~1.3 GB of VRAM for the whole session. On demand, it
+starts with the first picture instead.
+
+**How it works:**
+- The engine lends it that VRAM from the end of its expert cache. Those experts are computed by the CPU meanwhile.
+- The encoder stays loaded while pictures keep coming.
+- It unloads a while after the last picture, and the engine takes the VRAM back (refilled from RAM in ~0.1 s).
+- Text requests run all along.
+
+| Option | Config key | What it does |
+| --- | --- | --- |
+| `--vision-on-demand` | `"vision_on_demand": true` | the encoder starts with the first picture; the server gives the engine `--lendable-cache` |
+| `--vision-idle 600` | `"vision_idle_s": 600` | unload it this long after the last picture (default 600) |
+| `--vision-lend-mib 1400` | `"vision_lend_mib": 1400` | the VRAM lent to it (default 1400; the GPU encoder uses ~1.3 GB at 1024 image tokens) |
+
+**The reserve:**
+- Use it with `--expert-cache auto`, as setup writes it, and the same `--vram-reserve-mib` as without images.
+- The engine measures the VRAM that is free once its cache is written. The encoder is not there yet, so its share
+  goes to the cache until a picture borrows it.
+- A fixed `--expert-cache N` skips that measurement. With a fixed cache, a reserve raised by hand to leave room for a
+  resident encoder leaves that room idle.
+
+**Measured** on an RTX 5070 Ti 16 GB (PCIe 3.0, DDR4-2133), IQ3_XXS, 400K context, through the server (3 prompts ×
+2 × 400 greedy tokens):
+
+| Setup | Experts in VRAM | Decode |
+| --- | ---: | ---: |
+| The encoder resident | 3,609 | 59.8 tok/s |
+| On demand, no picture yet | 4,402 | 66.0 tok/s |
+| On demand, the encoder loaded | 3,523 | 55.4 tok/s |
+| On demand, after the idle unload | 4,402 | 65.2 tok/s |
+
+- **The first picture** takes 8.3 s to the answer: the loan, the encoder's start and the encode. Later new pictures
+  take 4.8 s.
+- **Exactness:** with `--pcie-frac 0` (byte-identical repeats), greedy replies after the VRAM came back were the
+  replies before the loan.
+- **VRAM:** the engine's VRAM was the same after each of 5 cycles.
+- **Limits:**
+  - One GPU and a profile-filled cache: not with a layer split or remote experts, where the engine refuses the loan.
+  - Not with the resident RAM mode when the lent experts are not all in RAM.
+
 ---
 
 ## Using it

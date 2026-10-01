@@ -158,7 +158,40 @@ public:
     /// Slots filled so far, for the startup report.
     int64_t fills() const { return fills_; }
 
+    /// **THE IMAGE ENCODER ON DEMAND: A CACHE THAT CAN LEND ITS LAST BYTES TO ANOTHER PROCESS.**  With a chunk size
+    /// set before `open`, the slots are not one `cudaMalloc` but `chunk_bytes` pieces of physical memory mapped
+    /// into one reserved address range (CUDA virtual memory management), so `release_tail` can give the last
+    /// pieces back to the driver - another process (`strata-vision`) then has that VRAM - and `remap_tail` maps
+    /// new memory at the SAME addresses: every pointer the graphs captured (`device_slot`, the slot offsets) stays
+    /// valid.  0 (the default) keeps the single allocation.  CUDA only; a HIP build refuses it in `open`.
+    void set_lendable(uint64_t chunk_bytes) { lend_chunk_ = chunk_bytes; }
+    bool lendable() const { return !vmm_.empty(); }
+    /// The first slot whose bytes `release_tail(bytes)` would unmap (even partly): `bytes` rounded up to whole
+    /// chunks from the end, at most all but the first chunk.  -1 when the cache is not lendable or `bytes` is 0.
+    int32_t tail_first_slot(uint64_t bytes) const;
+    /// Unmaps and frees the chunks `tail_first_slot(bytes)` covers.  **THE CALLER FIRST MARKS EVERY SLOT FROM THAT
+    /// ONE ON AS NON-RESIDENT AND SYNCHRONIZES THE DEVICE**: a kernel reading an unmapped slot is an illegal address,
+    /// which poisons the context for the whole process.  Returns the bytes released, 0 on failure (`err`).
+    uint64_t release_tail(uint64_t bytes, std::string& err);
+    /// Backs the released chunks again at the same addresses.  Their contents are undefined: the caller refills
+    /// every slot it marked before it marks them resident again.
+    bool remap_tail(std::string& err);
+    /// Bytes released and not yet mapped again.
+    uint64_t released_bytes() const;
+
 private:
+    struct VmmChunk {
+        uint64_t off = 0, bytes = 0;
+        unsigned long long handle = 0;   ///< CUmemGenericAllocationHandle; 0 while released
+    };
+    bool open_vmm(uint64_t want, std::string& err);
+    void close_vmm();
+    /// How many chunks `bytes` covers from the end (whole chunks, at most all but the first).
+    size_t tail_chunks(uint64_t bytes) const;
+    uint64_t lend_chunk_ = 0;
+    std::vector<VmmChunk> vmm_;          ///< empty: `base_` is one cudaMalloc
+    uint64_t vmm_reserved_ = 0;          ///< the address range's size
+    int vmm_device_ = 0;
 #if defined(STRATA_USE_HIP)
     bool ensure_blocking_staging(std::size_t bytes, std::string& err);
     uint8_t* blocking_staging_ = nullptr;
