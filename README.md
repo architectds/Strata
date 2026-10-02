@@ -3,6 +3,9 @@
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 
+<p align="center"><b>This fork reads prompts up to 1.56x faster than Strata 0.1.36</b>, from several speed PRs ·
+<a href="#about-this-fork">about this fork</a></p>
+
 <p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
 <sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
 <a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
@@ -10,6 +13,43 @@ NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open
 Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** - a large, smart AI model that
 normally needs a server - on a normal PC. It chats, writes code, reads pictures and works with your apps and coding
 agents, and nothing leaves your PC.
+
+## About this fork
+
+This fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) is tuned for speed. Its default branch, `best`, is
+the latest Strata release (v0.1.36) plus these changes:
+
+- **Three PRs offered upstream:** batched expert gathers on the prompt path
+  ([#439](https://github.com/Niko1221/Strata/pull/439), long prompts +4%), Q4_0 KV prompt attention on tensor cores
+  ([#452](https://github.com/Niko1221/Strata/pull/452), long prompts with `--kv q4_0` ~19% faster), and the draft
+  layer's K/V in a ring with KV streaming ([#453](https://github.com/Niko1221/Strata/pull/453), prompts +4.6% with
+  `--kv-resident`).
+- **CPU assist:** on prompts under 3,072 tokens the CPU computes part of the experts while the GPU computes the rest -
+  about 1.5x on prompts of 145-1,700 tokens, 1.2x at ~2,800 (NVIDIA builds; `STRATA_PREFILL_CPU=0` turns it off).
+- **Prompt chunks sized by the prompt** (`--prefill auto:16384`): as few chunks as fit, all of equal size.
+- **Images on demand** (`--vision-on-demand`): the image encoder borrows the expert cache's VRAM only while it is
+  loaded.
+- Upstream's fused int8 tensor-core experts switched on (`STRATA_PF_FUSED=1`).
+
+<p align="center"><img src="docs/fork/prefill-speed-036.png" width="900" alt="Prompt reading speed by prompt size: this fork vs stock Strata 0.1.36"></p>
+
+| Prompt | Stock 0.1.36 | This fork, int8 KV | This fork, q4_0 KV (fastest) |
+| --- | ---: | ---: | ---: |
+| 512 tokens | 249 tokens/s | 387 (1.56x) | 406 |
+| 2K | 645 | 885 (1.37x) | 944 |
+| 8K | 2,024 | 2,196 (1.09x) | 2,315 |
+| 32K | 2,120 | 2,835 (1.34x) | 2,999 |
+| 64K | 1,969 | 2,954 (1.50x) | 3,109 |
+| Writes answers | 60.4 tokens/s | 63.5 | 65.5 |
+
+Measured on 2026-10-02 on one PC: RTX 5070 Ti 16 GB on PCIe 3.0 x16 (ASRock X370), Ryzen 9 5900XT, 64 GB DDR4-2133,
+the IQ3_XXS model with a 400K context, through the server (median of 4-6 reads per size); stock with its default
+int8 KV cache. q4_0 KV reads ~5% faster than int8, but its predictions drift about 3x as far from an fp16 cache, and
+more at long context, so this PC runs int8.
+
+**Using it:** setup's ready-made engine is upstream's; for the engine changes above run setup with `--build` on this
+branch (it compiles the engine: on Windows that needs the CUDA toolkit and Visual Studio Build Tools). `main` stays
+identical to upstream; each change also lives on its own `carry/*` branch, rebased on every release.
 
 ## How fast is it?
 
