@@ -189,6 +189,26 @@ whole chunk at once; unpinned experts are copied by helper threads. Measured on 
 switch to `--prefill auto` the next time START-HERE / setup.sh starts them. The raw numbers:
 [`bench/results/`](../bench/results/). The [paper](paper/Strata-Paper.pdf) explains every number.
 
+**Chunks by prompt size (fork: `carry/prompt-chunks`):**
+- **Equal chunks:** a prompt reads in as few chunks as the chunk size allows, all the same size. 32,704 tokens with a
+  10,240-token limit read as 4 × 8,192, not 3 × 10,240 + 1,984.
+- **Why the count matters:**
+  - Every chunk streams nearly every expert the GPU does not hold, whatever its length: ~1.7 s each on PCIe 3.0.
+  - A bigger chunk therefore pays only where it saves a chunk.
+  - Equal chunks borrow no more cache slots than that count needs.
+- **Finer sizes above 8,192:** with `--prefill auto:16384` (or `auto:32768`), auto tries the sizes above 8,192 every
+  1,024 tokens. It takes the largest whose buffers fit, not only 16,384 or 8,192.
+- **Measured** on an RTX 5070 Ti 16 GB (PCIe 3.0), IQ3_XXS, 4,402 cache slots: 12,288-token chunks fit where 16,384
+  do not.
+
+  | Prompt | 8,192 chunks | 12,288 chunks |
+  | --- | ---: | ---: |
+  | 32K | 2,382 tok/s | 2,663 tok/s |
+  | 64K | 2,387 tok/s | 2,651 tok/s |
+
+  With 3,609 slots, 10,240-token chunks (unequal) were 4.9% slower at 32K and 6.4% faster at 64K
+  (`bench/results/2026-10-02-bottleneck-034`).
+
 ## Other GPUs (estimated)
 
 Not measured - estimated from the runs above (same CPU and 64 GB RAM): the GPU part scaled by memory bandwidth, the CPU
