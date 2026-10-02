@@ -103,9 +103,14 @@ constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_s
 // fixed cache: 1,500-token prompts 621 -> 785 / 612 -> 735 tok/s, 2,000 727 -> 934 / 712 -> 892, 4,000 (its last
 // chunk) 779 -> 912 / 766 -> 844, the same output.  Below ~1,000 tokens the output changed on Q2_0 (a smaller chunk
 // takes other kernels), so 1024 is the floor.  STRATA_PREFILL_STREAM_MIN overrides (A/B).
+// With CPU assist (Prefill::set_cpu_pool, STRATA_PREFILL_CPU) the chunks staged after their routing go up to 3,072
+// tokens instead (set by `init`), since the pool helps only there: measured on a 5070 Ti (PCIe 3.0, DDR4-2133,
+// IQ3_XXS) against the streamed walk, mean of two runs: 1K prompts 1.43x, 2K 1.38x, 4K 0.95x, 8K 0.80x.
+int64_t g_stream_min_cpu = 0;
 inline int64_t stream_all_min() {
-    static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) 1024; }();
-    return v;
+    static const int64_t env = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) -1; }();
+    if (env >= 0) return env;
+    return g_stream_min_cpu > 0 ? g_stream_min_cpu : (int64_t) 1024;
 }
 double g_pinned_share = 1.0;
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
@@ -605,6 +610,11 @@ struct Prefill::Impl {
     std::vector<strata::kernels::cpu::ExpertJobMulti> cpu_jobs;
     std::vector<uint8_t> on_cpu;
     double cpu_us_unit = 120.0, gpu_us_expert = 150.0;
+    // ...and per layer (0: not measured yet, the running averages above stand in): a layer's formats set both its
+    // blob size and the CPU's arithmetic (an IQ4_NL down costs the pool ~1.4x a Q2_0 one), so one average for all
+    // layers would leave every layer off balance one way or the other
+    std::vector<double> cpu_us_l, gpu_us_l;
+    int64_t cpu_g_layer = -1;
     double cpu_job_ms = 0;          // the last job's time on the side thread
     bool cpu_g_pending = false;     // cpu_g0..cpu_g1 bracket a GPU half not yet folded into gpu_us_expert
     int64_t cpu_g_streamed = 0;     // ...and the experts that half streamed
@@ -801,6 +811,10 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
+    // CPU assist on this path (every layer, a pool): its chunks are staged after routing up to 3,072 tokens - before
+    // the ring is sized below, and before any request's loan is (bytes_needed counts the ring the same way)
+    if (pool_ != nullptr && cpu_assist().on && stage_lb_ == 0 && stage_le_ == g.n_layers && next_ == nullptr)
+        g_stream_min_cpu = 3072;
     for (int b = 0; next_ != nullptr && b < 2; ++b)
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
@@ -2277,8 +2291,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (cpu_f) {
                             if (m.cpu_g_pending) {   // the last assisted layer's GPU half: its events have completed
                                 float gms = 0.0f;
-                                if (m.cpu_g_streamed > 0 && cudaEventElapsedTime(&gms, m.cpu_g0, m.cpu_g1) == cudaSuccess)
-                                    m.gpu_us_expert += 0.25 * (1000.0 * gms / (double) m.cpu_g_streamed - m.gpu_us_expert);
+                                if (m.cpu_g_streamed > 0 && cudaEventElapsedTime(&gms, m.cpu_g0, m.cpu_g1) == cudaSuccess) {
+                                    const double us = 1000.0 * gms / (double) m.cpu_g_streamed;
+                                    m.gpu_us_expert += 0.25 * (us - m.gpu_us_expert);
+                                    double& ul = m.gpu_us_l[(size_t) m.cpu_g_layer];
+                                    ul = ul > 0 ? ul + 0.5 * (us - ul) : us;
+                                }
                                 m.cpu_g_pending = false;
                             }
                             m.on_cpu.assign((size_t) m.g->n_expert, 0);
@@ -2292,11 +2310,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                             std::sort(cand.begin(), cand.end());
                             const size_t limit = ca.balance ? cand.size() : (size_t) std::llround(ca.share * (double) cand.size());
+                            if (m.cpu_us_l.size() != (size_t) g.n_layers) {
+                                m.cpu_us_l.assign((size_t) g.n_layers, 0.0);
+                                m.gpu_us_l.assign((size_t) g.n_layers, 0.0);
+                            }
+                            const double cpu_us = m.cpu_us_l[(size_t) l] > 0 ? m.cpu_us_l[(size_t) l] : m.cpu_us_unit;
+                            const double gpu_us = m.gpu_us_l[(size_t) l] > 0 ? m.gpu_us_l[(size_t) l] : m.gpu_us_expert;
                             for (size_t i = 0; i < limit; ++i) {
                                 const int32_t c = cand[i].first, e = cand[i].second;
                                 if (cpu_rows + c > m.cpu_out_rows) break;
                                 const double units = cpu_units + 1.0 + ca.token_cost * c;
-                                if (ca.balance && units * m.cpu_us_unit > (double) (nonres - cpu_n - 1) * m.gpu_us_expert) break;
+                                if (ca.balance && units * cpu_us > (double) (nonres - cpu_n - 1) * gpu_us) break;
                                 if (m.src->blob(l, e) == nullptr) continue;
                                 m.on_cpu[(size_t) e] = 1;
                                 cpu_units = units;
@@ -2860,15 +2884,19 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         }
                         // the balance: the pool's time per unit now; the GPU half's per streamed expert at the next
                         // assisted layer, when its events have completed
-                        m.cpu_us_unit += 0.25 * (1000.0 * m.cpu_job_ms / cpu_units - m.cpu_us_unit);
+                        const double cpu_us_now = 1000.0 * m.cpu_job_ms / cpu_units;
+                        m.cpu_us_unit += 0.25 * (cpu_us_now - m.cpu_us_unit);
+                        double& cl = m.cpu_us_l[(size_t) l];
+                        cl = cl > 0 ? cl + 0.5 * (cpu_us_now - cl) : cpu_us_now;
                         m.cpu_g_pending = true;
                         m.cpu_g_streamed = nonres - cpu_n;
+                        m.cpu_g_layer = l;
                         if (ca.log >= 2)
                             std::fprintf(stderr, "strata prefill cpu: layer %lld: %lld rows, %lld experts not resident, "
-                                         "%lld on the CPU (%lld rows), pool %.2f ms, waited %.2f ms; now CPU %.0f us/unit, "
-                                         "GPU %.0f us/streamed expert\n", (long long) l, (long long) (T * K),
-                                         (long long) nonres, (long long) cpu_n, (long long) cpu_rows, m.cpu_job_ms, waited,
-                                         m.cpu_us_unit, m.gpu_us_expert);
+                                         "%lld on the CPU (%lld rows), pool %.2f ms, waited %.2f ms; this layer now CPU %.0f "
+                                         "us/unit, GPU %.0f us/streamed expert (last known)\n", (long long) l,
+                                         (long long) (T * K), (long long) nonres, (long long) cpu_n, (long long) cpu_rows,
+                                         m.cpu_job_ms, waited, m.cpu_us_l[(size_t) l], m.gpu_us_l[(size_t) l]);
                     }
                     pt.mark(kPfCombine, cs);
                     if (peer_now) cudaStreamWaitEvent(m.cs, m.pp->ev_done, 0);   // multi-GPU: the peer's rows are in Dm
