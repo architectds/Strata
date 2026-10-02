@@ -5751,6 +5751,16 @@ int main(int argc, char** argv) {
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
+                // (as in generate) STRATA_DUMP_FIRST_LOGITS: the first window runs the prompt's last token over the state
+                // the prompt path left, so its logits are where two prompt paths can be compared by output
+                if (first_window)
+                    if (const char* fl = std::getenv("STRATA_DUMP_FIRST_LOGITS")) {
+                        std::vector<float> row((size_t) ver.vocab());
+                        std::FILE* f = ver.copy_logits(0, row.data()) ? std::fopen(fl, "wb") : nullptr;
+                        if (f == nullptr || std::fwrite(row.data(), sizeof(float), row.size(), f) != row.size())
+                            std::fprintf(stderr, "strata serve: STRATA_DUMP_FIRST_LOGITS: cannot write %s\n", fl);
+                        if (f) std::fclose(f);
+                    }
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
