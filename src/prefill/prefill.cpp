@@ -471,7 +471,8 @@ private:
 
 namespace {
 // STRATA_PREFILL_CPU: "auto" balances each layer's CPU half against its GPU half by their measured times; a number in
-// (0, 1] gives the CPU that share of the eligible experts (the A/B arm).  Unset or 0: off.  An expert is eligible when
+// (0, 1] gives the CPU that share of the eligible experts (the A/B arm); 0: off.  Unset: "auto" on CUDA builds, off on
+// HIP ones (measured only on an RTX 5070 Ti on PCIe 3.0 with DDR4-2133; the AMD path is untested).  An expert is eligible when
 // it is routed, not resident, a blob in RAM (not a GGUF read in place), and routed at most STRATA_PREFILL_CPU_MAXT
 // tokens (default 8, one pool job); the fewest-token ones go first.
 struct CpuAssist {
@@ -487,13 +488,18 @@ struct CpuAssist {
 const CpuAssist& cpu_assist() {
     static const CpuAssist c = [] {
         CpuAssist a;
-        if (const char* v = std::getenv("STRATA_PREFILL_CPU"); v != nullptr && *v != 0) {
-            if (std::strcmp(v, "auto") == 0) {
-                a.on = a.balance = true;
-            } else {
-                a.share = std::clamp(std::atof(v), 0.0, 1.0);
-                a.on = a.share > 0;
-            }
+#if defined(STRATA_USE_HIP)
+        const char* fallback = "0";
+#else
+        const char* fallback = "auto";
+#endif
+        const char* v = std::getenv("STRATA_PREFILL_CPU");
+        if (v == nullptr || *v == 0) v = fallback;
+        if (std::strcmp(v, "auto") == 0) {
+            a.on = a.balance = true;
+        } else {
+            a.share = std::clamp(std::atof(v), 0.0, 1.0);
+            a.on = a.share > 0;
         }
         if (const char* v = std::getenv("STRATA_PREFILL_CPU_MAXT")) a.max_tokens = std::clamp(std::atoi(v), 1, 256);
         if (const char* v = std::getenv("STRATA_PREFILL_CPU_TOKEN")) a.token_cost = std::max(0.0, std::atof(v));
