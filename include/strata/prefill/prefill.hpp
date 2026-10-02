@@ -82,10 +82,11 @@ public:
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
     static void set_ring_override(int slots);
 
-    /// CPU assist (STRATA_PREFILL_CPU, opt-in): a chunk that stages only its routed experts (below the streamed walk)
-    /// hands the expert pool the non-resident experts with the fewest tokens, so the pool reads those from RAM while
-    /// the copy engine brings the rest over PCIe.  The pool's arithmetic is the token path's CPU experts' (ggml-cpu),
-    /// not MMQ's, so the outputs are close to, not bitwise, the GPU-only path's.  Null (the default): GPU only.
+    /// CPU assist (STRATA_PREFILL_CPU: on by default on CUDA builds, 0 turns it off): a chunk that stages only its
+    /// routed experts (below the streamed walk) hands the expert pool the non-resident experts with the fewest tokens,
+    /// so the pool reads those from RAM while the copy engine brings the rest over PCIe.  The pool's arithmetic is the
+    /// token path's CPU experts' (ggml-cpu), not MMQ's, so the outputs are close to, not bitwise, the GPU-only path's.
+    /// Null pool: GPU only.
     /// Only a prompt path that runs every layer uses it (no layer split); the pool must be idle during `run`.
     void set_cpu_pool(strata::kernels::cpu::ExpertPool* pool);
 
