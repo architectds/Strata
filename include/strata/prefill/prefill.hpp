@@ -34,10 +34,13 @@ struct PrefillStats {
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     double ms_ple = 0;
+    int64_t experts_cpu = 0;        ///< expert-layer groups computed by the CPU expert pool (set_cpu_pool)
+    double ms_cpu_wait = 0;         ///< host time waiting for the pool after the GPU half was issued
 };
 
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; }
+namespace strata::kernels::cpu { class ExpertPool; }
 namespace strata::prefill {
 
 class Prefill {
@@ -78,6 +81,13 @@ public:
     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
     static void set_ring_override(int slots);
+
+    /// CPU assist (STRATA_PREFILL_CPU, opt-in): a chunk that stages only its routed experts (below the streamed walk)
+    /// hands the expert pool the non-resident experts with the fewest tokens, so the pool reads those from RAM while
+    /// the copy engine brings the rest over PCIe.  The pool's arithmetic is the token path's CPU experts' (ggml-cpu),
+    /// not MMQ's, so the outputs are close to, not bitwise, the GPU-only path's.  Null (the default): GPU only.
+    /// Only a prompt path that runs every layer uses it (no layer split); the pool must be idle during `run`.
+    void set_cpu_pool(strata::kernels::cpu::ExpertPool* pool);
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
@@ -124,6 +134,7 @@ private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    strata::kernels::cpu::ExpertPool* pool_ = nullptr;   ///< set_cpu_pool (kept by `reset`)
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
