@@ -47,6 +47,30 @@ the IQ3_XXS model with a 400K context, through the server (median of 4-6 reads p
 int8 KV cache. q4_0 KV reads ~5% faster than int8, but its predictions drift about 3x as far from an fp16 cache, and
 more at long context, so this PC runs int8.
 
+**How close is it to the official model?** The official Qwen 3.8 Flash (Alibaba's own service, through OpenCode's
+API) answered 31 prompts greedily with thinking off: documents of 1K-32K tokens to continue or summarize, and easy,
+medium and hard short tasks - 14,960 answer tokens. Strata then read exactly those answers on this PC, and at every
+token we checked whether it would have picked the same next token:
+
+| Local setup | Same next token as the official model | Where the official model was sure (69% of tokens) | Difference in the predictions (5-token KL) |
+| --- | ---: | ---: | ---: |
+| IQ3_XXS, int8 KV + fused experts (this PC) | 92.6% | 99.9% | 0.064 |
+| IQ3_XXS, q4_0 KV + fused experts (fastest) | 92.6% | 99.9% | 0.067 |
+| IQ3_XXS, fp16 KV + FP16 experts (most exact) | 92.7% | 99.9% | 0.064 |
+| IQ3_S, int8 KV + fused experts | 92.8% | 100.0% | 0.052 |
+| The official model against itself, asked twice | 97.5%* | | 0.010 |
+
+- **The gap is the 3-bit weights, not the speed settings:** the KV format and the fused experts move the predictions
+  by 0.001-0.003; IQ3_S, with more bits per weight, closes about a fifth of the gap. (Whether the service runs
+  exactly the open weights is not known; part of the gap may be that.)
+- **By task:** step-by-step math 96.4%, code 94.3%, long documents 91-93%, free writing (a story, explanations)
+  85.6% - where many words are equally good and the official model itself is least sure.
+- **The official service is not deterministic either:** asked twice at temperature 0, its two answers parted at token
+  9 (median); Strata's would part from it at token 8 (IQ3_XXS) or 13 (IQ3_S).
+
+<sub>* over the 846 tokens before its two answers parted. Measured 2026-10-02; Strata with the fixed test settings
+(`--expert-cache 3600`, IQ3_S 3000), the API's 5 most likely tokens per position (all it returns).</sub>
+
 **Using it:** setup's ready-made engine is upstream's; for the engine changes above run setup with `--build` on this
 branch (it compiles the engine: on Windows that needs the CUDA toolkit and Visual Studio Build Tools). `main` stays
 identical to upstream; each change also lives on its own `carry/*` branch, rebased on every release.
