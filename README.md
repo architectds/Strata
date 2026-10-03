@@ -3,7 +3,7 @@
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 
-<p align="center"><b>This fork reads prompts up to 1.56x faster than Strata 0.1.36</b>, from several speed PRs ·
+<p align="center"><b>This fork reads prompts up to 1.56x faster than Strata 0.1.36</b>, from several speed PRs (three now in Strata itself) ·
 <a href="#about-this-fork">about this fork</a></p>
 
 <p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
@@ -17,13 +17,11 @@ agents, and nothing leaves your PC.
 ## About this fork
 
 This fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) is tuned for speed. Its default branch, `best`, is
-the latest Strata release (v0.1.36) plus these changes:
+the latest Strata release (v0.1.38) plus the changes below. Its three earlier PRs are in Strata itself since v0.1.38:
+Q4_0 KV prompt attention on tensor cores ([#452](https://github.com/Niko1221/Strata/pull/452)), the draft layer's K/V
+in a ring with KV streaming ([#453](https://github.com/Niko1221/Strata/pull/453)), and batched expert gathers
+([#439](https://github.com/Niko1221/Strata/pull/439), taken up as #372). What the fork adds on top:
 
-- **Three PRs offered upstream:** batched expert gathers on the prompt path
-  ([#439](https://github.com/Niko1221/Strata/pull/439), long prompts +4%), Q4_0 KV prompt attention on tensor cores
-  ([#452](https://github.com/Niko1221/Strata/pull/452), long prompts with `--kv q4_0` ~19% faster), and the draft
-  layer's K/V in a ring with KV streaming ([#453](https://github.com/Niko1221/Strata/pull/453), prompts +4.6% with
-  `--kv-resident`).
 - **CPU assist:** on prompts under 3,072 tokens the CPU computes part of the experts while the GPU computes the rest -
   about 1.5x on prompts of 145-1,700 tokens, 1.2x at ~2,800 (NVIDIA builds; `STRATA_PREFILL_CPU=0` turns it off).
 - **Prompt chunks sized by the prompt** (`--prefill auto:16384`): as few chunks as fit, all of equal size.
@@ -42,7 +40,8 @@ the latest Strata release (v0.1.36) plus these changes:
 | 64K | 1,969 | 2,954 (1.50x) | 3,109 |
 | Writes answers | 60.4 tokens/s | 63.5 | 65.5 |
 
-Measured on 2026-10-02 on one PC: RTX 5070 Ti 16 GB on PCIe 3.0 x16 (ASRock X370), Ryzen 9 5900XT, 64 GB DDR4-2133,
+Measured on 2026-10-02 against v0.1.36, before the three PRs were in the stock engine (from v0.1.38 stock has them
+too, so its lead is smaller there), on one PC: RTX 5070 Ti 16 GB on PCIe 3.0 x16 (ASRock X370), Ryzen 9 5900XT, 64 GB DDR4-2133,
 the IQ3_XXS model with a 400K context, through the server (median of 4-6 reads per size); stock with its default
 int8 KV cache. q4_0 KV reads ~5% faster than int8, but its predictions drift about 3x as far from an fp16 cache, and
 more at long context, so this PC runs int8.
